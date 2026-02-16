@@ -36,7 +36,9 @@ def _orchestrate(
     - Frames + audio -> MP4 via ffmpeg muxing.
     """
     # STEP 2 — Phoneme extraction (forced alignment)
-    phonemes = extract_phonemes(audio_buffer)
+    transcript = "ah"
+
+    phonemes = extract_phonemes(audio_buffer , transcript)
     # Output must be sorted; assert to fail fast if aligner returns bad data.
     for i in range(1, len(phonemes)):
         assert (

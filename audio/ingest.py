@@ -1,7 +1,7 @@
 import io
 import wave
 from typing import Union
-
+import soundfile as sf
 import numpy as np
 
 from models import AudioBuffer
@@ -24,7 +24,39 @@ def _normalize_audio(samples: np.ndarray) -> np.ndarray:
     return samples
 
 
-def load_audio_from_wav_bytes(data: Union[bytes, bytearray, memoryview]) -> AudioBuffer:
+def load_audio_from_wav_bytes(
+    data: Union[bytes, bytearray, memoryview]
+) -> AudioBuffer:
+    """
+    Ingest WAV buffer held in memory.
+
+    Enforces:
+    - mono (auto converts if stereo)
+    - float32
+    - sample_rate == 22050 Hz
+    """
+
+    assert isinstance(
+        data, (bytes, bytearray, memoryview)
+    ), "Expected in-memory WAV buffer (bytes-like object)."
+
+    with io.BytesIO(data) as bio:
+        samples, sample_rate = sf.read(bio, dtype="float32")
+
+    # Convert stereo → mono if needed
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+
+    samples = np.asarray(samples, dtype=np.float32)
+
+    assert (
+        sample_rate == 22050
+    ), f"Expected sample rate 22050 Hz, got {sample_rate}."
+
+    samples = _normalize_audio(samples)
+
+    return AudioBuffer(samples=samples, sample_rate=sample_rate)
+
     """
     Ingest a mono float32 WAV buffer held in memory.
 
@@ -69,4 +101,3 @@ def load_audio_from_wav_bytes(data: Union[bytes, bytearray, memoryview]) -> Audi
     samples = _normalize_audio(samples)
 
     return AudioBuffer(samples=samples, sample_rate=sample_rate)
-

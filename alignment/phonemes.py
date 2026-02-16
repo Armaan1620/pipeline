@@ -1,132 +1,161 @@
 import os
+import subprocess
+import tempfile
 from typing import List
+
+from praatio import textgrid
 
 from models import AudioBuffer, Phoneme
 
 
+# ---------------------------------------------------------------------
+# DEV STUB
+# ---------------------------------------------------------------------
+
 def _extract_phonemes_dev_stub(audio: AudioBuffer) -> List[Phoneme]:
-    """
-    Deterministic development stub for phoneme extraction (testing only).
+    duration = audio.samples.shape[0] / audio.sample_rate
 
-    Returns a hard-coded sequence of phonemes covering ~2 seconds that exercises
-    multiple visemes. This allows testing the pipeline end-to-end without a
-    forced aligner installed.
-
-    Phonemes chosen to exercise different viseme groups:
-    - AA (wide open vowel) -> AA viseme
-    - M (bilabial nasal) -> PBM viseme
-    - F (labiodental) -> FV viseme
-    - S (alveolar fricative) -> SZ viseme
-    - AH (open vowel) -> AA viseme
-    - P (bilabial plosive) -> PBM viseme
-
-    Timestamps:
-    - Start at 0.0
-    - Sorted and non-overlapping
-    - Total duration ~2 seconds (will be clipped to actual audio duration)
-    """
-    # Hard-coded phoneme sequence with deterministic timestamps.
-    stub_phonemes = [
-        Phoneme(symbol="AA", start=0.0, end=0.25),
-        Phoneme(symbol="M", start=0.25, end=0.45),
-        Phoneme(symbol="F", start=0.45, end=0.65),
-        Phoneme(symbol="S", start=0.65, end=0.85),
-        Phoneme(symbol="AH", start=0.85, end=1.10),
-        Phoneme(symbol="P", start=1.10, end=1.30),
-        Phoneme(symbol="AA", start=1.30, end=1.55),
-        Phoneme(symbol="M", start=1.55, end=1.75),
-        Phoneme(symbol="SIL", start=1.75, end=2.00),
+    phonemes = [
+        ("SIL", 0.00, 0.20),
+        ("AA", 0.20, 0.45),
+        ("M", 0.45, 0.65),
+        ("F", 0.65, 0.85),
+        ("S", 0.85, 1.05),
+        ("AH", 1.05, 1.30),
+        ("P", 1.30, 1.55),
+        ("AA", 1.55, 1.85),
+        ("SIL", 1.85, 2.10),
     ]
 
-    # Clip to actual audio duration if stub sequence is longer.
-    audio_duration = audio.samples.shape[0] / float(audio.sample_rate)
-    clipped = [
-        Phoneme(symbol=p.symbol, start=p.start, end=min(p.end, audio_duration))
-        for p in stub_phonemes
-        if p.start < audio_duration
-    ]
+    out: List[Phoneme] = []
+    for symbol, start, end in phonemes:
+        if start >= duration:
+            break
+        out.append(
+            Phoneme(
+                symbol,
+                start,
+                min(end, duration),
+            )
+        )
 
-    return clipped
+    return out
 
+
+# ---------------------------------------------------------------------
+# REAL MFA EXTRACTION
+# ---------------------------------------------------------------------
 
 def _extract_phonemes_with_mfa(
     audio: AudioBuffer,
     transcript: str,
-    mfa_model_path: str,
 ) -> List[Phoneme]:
-    """
-    Extract phonemes using Montreal Forced Aligner (MFA).
 
-    This function defines the API shape for MFA integration but does not yet
-    implement the actual execution. The expected workflow is:
+    with tempfile.TemporaryDirectory(prefix="mfa_run_") as work_dir:
+        corpus_dir = os.path.join(work_dir, "corpus")
+        output_dir = os.path.join(work_dir, "output")
+        os.makedirs(corpus_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-    1. Write audio buffer to a temporary WAV file (mono, float32, 22050 Hz).
-    2. Write transcript to a temporary text file.
-    3. Invoke MFA via subprocess with:
-       - MFA model path (e.g., "english_us_arpa" or custom model directory).
-       - Input WAV and transcript paths.
-       - Output directory for alignment results.
-    4. Parse MFA's phoneme-level output (typically TextGrid or similar format).
-    5. Convert parsed alignments to List[Phoneme] with ARPAbet symbols and
-       timestamps in seconds.
-    6. Clean up temporary files.
-    7. Return sorted, non-overlapping phonemes.
+        wav_path = os.path.join(corpus_dir, "utt.wav")
+        txt_path = os.path.join(corpus_dir, "utt.txt")
 
-    To preserve determinism:
-    - Use fixed MFA model version.
-    - Disable any randomization in MFA configuration.
-    - Parse output format consistently (handle edge cases explicitly).
+        from audio.ingest import write_wav_file
 
-    Args:
-        audio: Normalized mono float32 AudioBuffer at 22050 Hz.
-        transcript: Text transcript corresponding to the audio (required by MFA).
-        mfa_model_path: Path to MFA acoustic model or model name.
+        write_wav_file(wav_path, audio)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(transcript.strip())
 
-    Returns:
-        List[Phoneme] sorted by start time, non-overlapping, with ARPAbet symbols.
+        cmd = [
+            "mfa",
+            "align",
+            corpus_dir,
+            "english_us_arpa",
+            "english_mfa",
+            output_dir,
+            "--clean",
+            "--beam",
+            "100",
+            "--retry_beam",
+            "400",
+            "--single_speaker",
+            "--quiet",
+        ]
 
-    Raises:
-        NotImplementedError: This function is a scaffold and not yet implemented.
-    """
-    raise NotImplementedError(
-        "MFA integration is not yet implemented. "
-        "This function defines the API shape for future MFA integration. "
-        "To use the development stub for testing, set PHONEME_MODE=stub."
-    )
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"MFA alignment failed:\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
+            )
+
+        textgrid_path = None
+        for root, _, files in os.walk(output_dir):
+            for fn in files:
+                if fn.lower().endswith(".textgrid"):
+                    textgrid_path = os.path.join(root, fn)
+                    break
+
+        if textgrid_path is None:
+            raise RuntimeError("MFA completed but no TextGrid was produced.")
+
+        tg = textgrid.openTextgrid(
+            textgrid_path,
+            includeEmptyIntervals=False,
+        )
+
+        if "phones" not in tg.tierNames:
+            raise RuntimeError(
+                f"TextGrid missing 'phones' tier. Found: {tg.tierNames}"
+            )
+
+        phones_tier = tg.getTier("phones")
+
+        phonemes: List[Phoneme] = []
+        for start, end, symbol in phones_tier.entries:
+            if not symbol:
+                continue
+            phonemes.append(
+                Phoneme(
+                    symbol.upper(),
+                    float(start),
+                    float(end),
+                )
+            )
+
+        if not phonemes:
+            raise RuntimeError("No phonemes extracted from MFA output.")
+
+        return phonemes
 
 
-def extract_phonemes(audio: AudioBuffer) -> List[Phoneme]:
-    """
-    Perform forced alignment to extract ARPAbet phonemes with timestamps.
+# ---------------------------------------------------------------------
+# PUBLIC API
+# ---------------------------------------------------------------------
 
-    Modes:
-    - DEV STUB (PHONEME_MODE=stub): Returns a deterministic hard-coded phoneme
-      sequence for testing. Only activated when environment variable is explicitly
-      set to "stub". Does NOT silently fall back to stub mode.
-    - REAL ALIGNER (default): Raises NotImplementedError until a forced aligner
-      (e.g. MFA) is integrated via `_extract_phonemes_with_mfa`.
+def extract_phonemes(
+    audio: AudioBuffer,
+    transcript: str | None = None,
+) -> List[Phoneme]:
 
-    Assumptions:
-    - `audio` has already been validated and normalized.
-    - Time units are seconds (float) relative to audio start.
-    - Output is sorted by `start` and non-overlapping.
+    mode = os.environ.get("PHONEME_MODE")
 
-    To use the development stub for testing:
-        PHONEME_MODE=stub python main.py input.wav render/sprites output.mp4
-
-    To integrate MFA:
-        Implement `_extract_phonemes_with_mfa` and call it from here with
-        appropriate transcript and model path arguments.
-    """
-    phoneme_mode = os.environ.get("PHONEME_MODE", "").strip().lower()
-
-    if phoneme_mode == "stub":
+    if mode == "stub":
         return _extract_phonemes_dev_stub(audio)
 
-    # Default behavior: fail fast until real aligner is integrated.
-    raise NotImplementedError(
-        "Phoneme extraction is not implemented. "
-        "Set PHONEME_MODE=stub for development/testing, or "
-        "integrate MFA via `_extract_phonemes_with_mfa`."
-    )
+    if mode != "real":
+        raise RuntimeError(
+            "PHONEME_MODE must be explicitly set to 'stub' or 'real'."
+        )
 
+    if not transcript:
+        raise RuntimeError(
+            "Transcript is required when PHONEME_MODE=real."
+        )
+
+    return _extract_phonemes_with_mfa(audio, transcript)
